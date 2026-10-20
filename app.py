@@ -29,10 +29,32 @@ if not API_KEY:
         API_KEY = None
 
 # ── SESSION STATE ─────────────────────────────────────────────
+# ── MODEL ─────────────────────────────────────────────────────
+# Groq retires models from time to time, so the app tries a short list in order.
+# Set GROQ_MODEL in .env or Streamlit secrets to put your own choice first.
+def _setting(name):
+    val = os.getenv(name)
+    if not val:
+        try:
+            val = st.secrets.get(name)
+        except Exception:
+            val = None
+    return val
+
+GROQ_MODELS = [m for m in [
+    _setting("GROQ_MODEL"),
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+] if m]
+GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))
+
 if "messages"  not in st.session_state: st.session_state.messages  = []
 if "profile"   not in st.session_state: st.session_state.profile   = {"name":None,"age":None,"gender":None,"conditions":None,"step":"name"}
 if "api_key"   not in st.session_state: st.session_state.api_key   = API_KEY
 if "connected" not in st.session_state: st.session_state.connected = bool(API_KEY)
+if "model"     not in st.session_state: st.session_state.model     = None
 
 # ── CSS ───────────────────────────────────────────────────────
 st.markdown("""
@@ -186,15 +208,24 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     st.markdown("<div style='font-size:12px;color:#7A90AB;margin-bottom:6px'>Groq API Key (Free)</div>", unsafe_allow_html=True)
-    key_input = st.text_input("", placeholder="gsk_...", type="password", label_visibility="collapsed")
+    key_input = st.text_input("Groq API key", placeholder="gsk_...", type="password", label_visibility="collapsed")
 
     if st.button("🔑 Connect Groq"):
-        if len(key_input) > 20:
-            st.session_state.api_key = key_input
-            st.session_state.connected = True
-            st.success("✅ Connected!")
+        key = (key_input or "").strip()
+        if not key.startswith("gsk_") or len(key) < 20:
+            st.error("❌ That doesn't look like a Groq key. It should start with gsk_")
         else:
-            st.error("❌ Invalid key")
+            try:
+                Groq(api_key=key, timeout=15).models.list()
+                st.session_state.api_key = key
+                st.session_state.connected = True
+                st.success("✅ Connected!")
+            except Exception as e:
+                st.session_state.connected = False
+                if "401" in str(e) or "invalid" in str(e).lower():
+                    st.error("❌ Groq rejected this key. Check it at console.groq.com")
+                else:
+                    st.error("❌ Couldn't reach Groq right now. Please try again.")
 
     if st.session_state.connected:
         st.markdown("<div style='background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.3);border-radius:6px;padding:8px 12px;font-size:12px;color:#6EE7B7'>🟢 Groq AI Active</div>", unsafe_allow_html=True)
@@ -207,7 +238,7 @@ with st.sidebar:
     <strong style='color:#B8CADE'>Get free key:</strong><br>
     <a href='https://console.groq.com' target='_blank' style='color:#14B8A6'>console.groq.com</a><br><br>
     <strong style='color:#B8CADE'>Streamlit Secrets:</strong><br>
-    <code style='color:#14B8A6'>GOOGLE_API_KEY = "gsk_..."</code>
+    <code style='color:#14B8A6'>GROQ_API_KEY = "gsk_..."</code>
     </div>
     """, unsafe_allow_html=True)
 
@@ -259,28 +290,51 @@ USER PROFILE: Name={p['name'] or 'unknown'}, Age={p['age'] or 'unknown'}, Gender
 RESPONSE STYLE: Friendly and genuinely helpful. Bullet points for clarity. Max 250 words. Always end with relevant NHS number or service."""
 
 
+def _is_model_error(err):
+    e = err.lower()
+    return ("model" in e and ("decommission" in e or "not found" in e or "does not exist" in e
+            or "not supported" in e or "deprecat" in e)) or "404" in e
+
 def call_ai(user_msg):
-    try:
-        client = Groq(api_key=st.session_state.api_key)
-        messages = [{"role": "system", "content": build_prompt()}]
-        for m in st.session_state.messages[:-1]:
-            messages.append({
-                "role": m["role"] if m["role"] == "user" else "assistant",
-                "content": m["content"]
-            })
-        messages.append({"role": "user", "content": user_msg})
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=600,
-            temperature=0.7
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        err = str(e)
-        if "429" in err or "rate" in err.lower():
-            return "⚠️ Rate limit reached. Please wait a moment and try again.\n\nEmergency: **call 999** | Urgent: **call 111** | Mental health: **Samaritans 116 123**"
-        return f"⚠️ Connection error: {err}\n\nEmergency: **999** | Urgent: **111** | Mental health: **116 123**"
+    client = Groq(api_key=st.session_state.api_key, timeout=30)
+    messages = [{"role": "system", "content": build_prompt()}]
+    # Last few turns only, without earlier error notices
+    history = [m for m in st.session_state.messages[:-1] if not m["content"].startswith("⚠️")][-10:]
+    for m in history:
+        messages.append({"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]})
+    messages.append({"role": "user", "content": user_msg})
+
+    models = GROQ_MODELS
+    if st.session_state.model in models:
+        models = [st.session_state.model] + [m for m in models if m != st.session_state.model]
+
+    last_err = ""
+    for model in models:
+        try:
+            kwargs = dict(model=model, messages=messages, temperature=0.6, max_completion_tokens=1200)
+            if model.startswith("openai/gpt-oss"):
+                kwargs["extra_body"] = {"reasoning_effort": "low"}
+            response = client.chat.completions.create(**kwargs)
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                st.session_state.model = model
+                return text
+            last_err = "empty response"
+        except Exception as e:
+            last_err = str(e)
+            if _is_model_error(last_err):
+                continue  # try the next model
+            break
+
+    low = last_err.lower()
+    if "401" in low or "invalid api key" in low or "invalid_api_key" in low:
+        st.session_state.connected = False
+        note = "⚠️ The Groq key was rejected, so I've switched to demo mode. You can add a new key in the sidebar."
+    elif "429" in low or "rate" in low:
+        note = "⚠️ The AI is busy right now (rate limit), so here is offline guidance instead."
+    else:
+        note = "⚠️ The AI service is unavailable right now, so here is offline guidance instead."
+    return note + "\n\n" + fallback(user_msg)
 
 def fallback(msg):
     m = msg.lower()
@@ -464,7 +518,7 @@ st.markdown("""
 <div class="steps-row">
   <div class="step-item"><div class="step-circle" style="border:1.5px solid #E63950;color:#E63950">01</div><h3>Build Your Profile</h3><p>Name, age, conditions, medications</p></div>
   <div class="step-item"><div class="step-circle" style="border:1.5px solid #0D9488;color:#14B8A6">02</div><h3>Describe Your Issue</h3><p>Symptoms or health question in plain English</p></div>
-  <div class="step-item"><div class="step-circle" style="border:1.5px solid #818CF8;color:#A5B4FC">03</div><h3>AI + NHS Research</h3><p>Gemini cross-references NICE pathways and BNF</p></div>
+  <div class="step-item"><div class="step-circle" style="border:1.5px solid #818CF8;color:#A5B4FC">03</div><h3>AI + NHS Research</h3><p>The AI cross-references NICE pathways and BNF</p></div>
   <div class="step-item"><div class="step-circle" style="border:1.5px solid #10B981;color:#6EE7B7">04</div><h3>Personalised Answer</h3><p>NHS-aligned advice tailored to your profile</p></div>
   <div class="step-item"><div class="step-circle" style="border:1.5px solid #F59E0B;color:#FCD34D">05</div><h3>NHS Signposting</h3><p>Directed to 111, GP, pharmacy, A&E or 999</p></div>
 </div>
@@ -476,12 +530,12 @@ st.markdown('<div id="chatbot" class="sec-wrap-dk">', unsafe_allow_html=True)
 col_info, col_chat = st.columns([1, 1.2], gap="large")
 
 with col_info:
-    status_txt = "Groq LLaMA 3.3" if st.session_state.connected else "Demo Mode"
+    status_txt = "Groq AI" if st.session_state.connected else "Demo Mode"
     status_col = "#6EE7B7" if st.session_state.connected else "#FCD34D"
     st.markdown(f"""
-    <div class="sec-tag">Gemini AI Powered</div>
+    <div class="sec-tag">Groq AI Powered</div>
     <div class="sec-h2">Talk to Florence</div>
-    <p style="color:#7A90AB;line-height:1.75;margin-bottom:14px;font-family:'DM Sans',sans-serif">Florence is powered by Google Gemini. She follows NHS pathways, NICE guidelines, and UK medication standards in every response.</p>
+    <p style="color:#7A90AB;line-height:1.75;margin-bottom:14px;font-family:'DM Sans',sans-serif">Florence runs on fast open models served by Groq. She follows NHS pathways, NICE guidelines, and UK medication standards in every response.</p>
     <div class="pill-row">
       <span class="pill pill-nhs">✓ NHS 111</span><span class="pill pill-teal">✓ NICE</span>
       <span class="pill pill-red">✓ Emergency Detection</span><span class="pill">✓ BNF Medicines</span>
@@ -500,7 +554,7 @@ with col_chat:
         <img src="data:image/png;base64,{MASCOT}" class="chat-av-img" alt="Florence"/>
         <div>
           <div class="chat-hname">Florence · MediPulse AI</div>
-          <div class="chat-hstatus">Active now · {'Groq LLaMA 3.3' if st.session_state.connected else 'Demo'}</div>
+          <div class="chat-hstatus">Active now · {'Groq AI' if st.session_state.connected else 'Demo'}</div>
         </div>
         <div class="nhs-v">✓ NHS Aligned</div>
       </div>
@@ -545,7 +599,7 @@ with col_chat:
 
     icol, bcol = st.columns([5,1])
     with icol:
-        user_input = st.text_input("", placeholder="Type your health question...",
+        user_input = st.text_input("Your message", placeholder="Type your health question...",
                                    key=f"chat_in_{st.session_state.input_key}",
                                    label_visibility="collapsed")
     with bcol:
@@ -635,7 +689,7 @@ st.markdown(f"""
   <div class="bio-text">
     <div class="sec-tag">Our Mascot</div>
     <div class="sec-h2">Meet Florence</div>
-    <p>Florence is inspired by Florence Nightingale — founder of modern nursing. Powered by Google Gemini, she follows NHS England guidelines, NICE clinical pathways, and BNF data.</p>
+    <p>Florence is inspired by Florence Nightingale — founder of modern nursing. Powered by Groq, she follows NHS England guidelines, NICE clinical pathways, and BNF data.</p>
     <div class="trait-grid">
       <div class="trait-card"><span>🏥</span><strong>NHS Compliant</strong><p>Follows NHS 111 and NICE guidelines</p></div>
       <div class="trait-card"><span>🔬</span><strong>Evidence-Based</strong><p>BNF drug data and MHRA safety alerts</p></div>

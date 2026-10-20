@@ -12,13 +12,13 @@ This repository holds the live version of the app.
 - Safety rules on every reply: emergencies go to 999, urgent cases to NHS 111, mental health crises to Samaritans (116 123)
 - Never diagnoses or prescribes; always signposts to NHS services
 - Collects a short profile (name, age, gender, existing conditions) one question at a time to make answers more relevant
-- Demo mode with fallback answers for key topics when no API key is connected
+- Demo mode with offline answers for key topics when no API key is connected, and the same offline answers if the AI service is down
 
 ## Built with
 
 - Python
 - Streamlit
-- Groq API with Meta's Llama 3.3 70B (`llama-3.3-70b-versatile`)
+- Groq API with open models (`openai/gpt-oss-120b` by default). If a model is retired, the app falls back to the next one automatically. Set `GROQ_MODEL` to choose your own.
 
 ## Run it locally
 
